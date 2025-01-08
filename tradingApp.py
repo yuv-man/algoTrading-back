@@ -7,6 +7,7 @@ import time
 import pandas as pd
 from ibapi.contract import Contract
 from strategies import *
+from IBKRWrapper import IBKRWrapper
 from trading_engine import TradingEngine
 from trendAnalyzer import StockTrendAnalyzer
 from strategyValidator import StrategyValidator, StrategyHandler
@@ -45,8 +46,12 @@ class TradingApplication:
         self.position_size = 100000
         self.max_drawdown = 0
         self.trades = None
+        self.uptrends = None
+        self.downtrends = None
+        self.peaks= None 
+        self.troughs = None
         self.saveHistoricalDataToCSV = False
-        self.loadHistoricalDataFromCSV = True
+        self.loadHistoricalDataFromCSV = False
 
     def register_strategy(self, symbol, strategy_type: str, params: Dict[str, Any], sec_type: str = "STK", currency: str = "USD", 
                  exchange: str = "SMART") -> Dict:
@@ -115,8 +120,8 @@ class TradingApplication:
                         interval=self.interval,
                         symbol=symbol
                     )
-            
             intra_day_data_with_trends = self.daily_trends_analyze()
+            print(intra_day_data_with_trends)
             return {'intraday_data': intra_day_data_with_trends, 'daily_data': self.daily_data}         
 
         except Exception as e:
@@ -451,7 +456,7 @@ class TradingApplication:
         """Start live trading"""
         self.interval = interval
         try:
-            result = self.trading_engine.start_trading(self.interval)
+            result = self.trading_engine.start_trading(self.symbol, self.interval)
             logger.info("Live trading started")
             return {
                 'status': 'success',
@@ -543,7 +548,6 @@ class TradingApplication:
                 raise ValueError(f"Invalid period format: {period}")
             
             self.start_date = start.strftime('%Y%m%d %H:%M:%S')
-            self.start_date = None
             self.end_date = end.strftime('%Y%m%d %H:%M:%S') 
             return period
         
@@ -647,6 +651,7 @@ class TradingApplication:
         analyzer = StockTrendAnalyzer(self.symbol, self.daily_data)
         self.peaks, self.troughs = analyzer.find_peaks_and_troughs()
         self.uptrends, self.downtrends, self.daily_data = analyzer.identify_trends()
+
         #plt = analyzer.visualize_trends()
         #plt.show()
         if self.intraday_data is not None:

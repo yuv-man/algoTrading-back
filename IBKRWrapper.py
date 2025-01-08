@@ -75,7 +75,7 @@ class IBKRWrapper(EWrapper, EClient):
                     self.logger.info(f"Reconnection attempt {self.reconnect_count}/{self.max_reconnect_attempts}")
                     
                     # Disconnect if still connected
-                    if self.isConnected():
+                    if self.is_connected:
                         self.disconnect()
                     
                     # Wait before reconnecting
@@ -209,54 +209,55 @@ class IBKRWrapper(EWrapper, EClient):
 
     def histData(self, req_num, contract, duration, candle_size, end_datetime=''):
         """
-        Request historical data
-        
-        Args:
-            req_num (int): Request identifier
-            contract (Contract): The contract to request data for
-            duration (str): Duration of data (e.g., "1 D", "1 M", "1 Y")
-            candle_size (str): Bar size setting (e.g., "1 min", "1 hour")
-            end_datetime (str): End date and time for the request (format: "YYYYMMDD HH:mm:ss")
-            
-        Returns:
-            pandas.DataFrame: DataFrame containing the historical data
+        Request historical data with better error handling
         """
-        # Reset data structures for this request
-        self.historical_data = []  
-        self.historical_data_end = False
-        
-        # Make the request
-        self.reqHistoricalData(
-            reqId=req_num,
-            contract=contract,
-            endDateTime=end_datetime,
-            durationStr=duration,
-            barSizeSetting=candle_size,
-            whatToShow='ADJUSTED_LAST',
-            useRTH=1,
-            formatDate=1,
-            keepUpToDate=0,
-            chartOptions=[]
-        )
-        
-        # Wait for data to arrive
-        timeout = 60  # 60 seconds timeout
-        start_time = time.time()
-        
-        while not self.historical_data_end:
-            time.sleep(0.1)  # Small delay to prevent CPU spinning
-            if time.time() - start_time > timeout:
-                print(f"Historical data request timed out after {timeout} seconds")
-                break
+        try:
+            if not self.is_connected:
+                raise ConnectionError("Not connected to IBKR")
+    
+            # Reset data structures
+            self.historical_data = []  
+            self.historical_data_end = False
             
-        # Convert to DataFrame if we have data
-        if self.historical_data:
+            print(f"Requesting historical data for {contract.symbol}")
+            
+            # Make the request
+            self.reqHistoricalData(
+                reqId=req_num,
+                contract=contract,
+                endDateTime=end_datetime,
+                durationStr=duration,
+                barSizeSetting=candle_size,
+                whatToShow='ADJUSTED_LAST',
+                useRTH=1,
+                formatDate=1,
+                keepUpToDate=0,
+                chartOptions=[]
+            )
+            
+            # Wait for data with timeout
+            timeout = 60  # 60 seconds timeout
+            start_time = time.time()
+            
+            while not self.historical_data_end:
+                time.sleep(0.1)
+                if time.time() - start_time > timeout:
+                    raise TimeoutError(f"Historical data request timed out after {timeout} seconds")
+                
+            if not self.historical_data:
+                raise ValueError(f"No historical data received for {contract.symbol}")
+                
+            # Convert to DataFrame
             df = pd.DataFrame(self.historical_data)
-            df['Timestamp'] = pd.to_datetime(df['Timestamp'])
-            df.set_index('Timestamp', inplace=True)
+            df.columns = df.columns.str.lower()
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df.set_index('timestamp', inplace=True)
+            
             return df
-        
-        return None
+            
+        except Exception as e:
+            print(f"Error requesting historical data: {str(e)}")
+            raise
 
     def request_historical_data(self, contract, interval):
         """Request historical data from IB"""

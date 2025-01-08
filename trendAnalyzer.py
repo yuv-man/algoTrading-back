@@ -378,65 +378,52 @@ class StockTrendAnalyzer:
     def apply_daily_trends_to_intraday(self, intraday_data):
         """
         Apply daily trends to intraday data and identify the last relevant peak/trough.
-        
-        Parameters:
-            daily_analyzer: TrendAnalyzer instance with daily trends already identified
-            intraday_data: DataFrame with intraday data including datetime index
-            
-        Returns:
-            DataFrame: intraday_data with added columns for daily_trend, last_daily_peak, last_daily_trough
         """
         # Make a copy to avoid modifying original data
         intraday = intraday_data.copy()
         
-        # Add new columns
+        # Add new columns properly
         intraday['daily_trend'] = None
-        intraday['last_daily_peak'] = None
-        intraday['last_daily_trough'] = None
-        
-        # Get daily date range
-        daily_dates = self.data.index.date
+        intraday['last_daily_peak'] = np.nan
+        intraday['last_daily_trough'] = np.nan
         
         # Process each intraday bar
-        for idx in intraday.index:
-            current_date = idx.date()
+        for i, (idx, row) in enumerate(intraday.iterrows()):
+            current_ts = idx.timestamp()
             
-            # Skip if date not in daily analysis
-            if current_date not in daily_dates:
-                continue
-                
             # Find active trends for this date
             active_uptrend = None
             active_downtrend = None
             
             # Check uptrends
             for trend in self.uptrends:
-                trend_start_date = self.data.index[trend.start_idx].date()
-                trend_end_date = self.data.index[trend.end_idx].date()
-                
-                if trend_start_date <= current_date <= trend_end_date:
+                start_ts = self.data.index.to_numpy()[trend.start_idx].astype(datetime)
+                end_ts = self.data.index.to_numpy()[trend.end_idx].astype(datetime)
+                print(start_ts, current_ts, end_ts)  # Debugging print
+                if start_ts <= current_ts <= end_ts:  # Fix applied here
                     active_uptrend = trend
                     break
                     
             # Check downtrends
             for trend in self.downtrends:
-                trend_start_date = self.data.index[trend.start_idx].date()
-                trend_end_date = self.data.index[trend.end_idx].date()
-                
-                if trend_start_date <= current_date <= trend_end_date:
+                start_ts = self.data.index.to_numpy()[trend.start_idx].astype(datetime)
+                end_ts = self.data.index.to_numpy()[trend.end_idx].astype(datetime)
+                if start_ts <= current_ts <= end_ts:  # Fix applied here
                     active_downtrend = trend
                     break
-            
+             # This should now be reached
+    
             # Set trend based on which is active (priority to most recent)
             if active_uptrend and active_downtrend:
-                if active_uptrend.end_idx > active_downtrend.end_idx:
-                    intraday.at[idx, 'daily_trend'] = 'uptrend'
-                else:
-                    intraday.at[idx, 'daily_trend'] = 'downtrend'
+                trend_value = 'uptrend' if active_uptrend.end_idx > active_downtrend.end_idx else 'downtrend'
             elif active_uptrend:
-                intraday.at[idx, 'daily_trend'] = 'uptrend'
+                trend_value = 'uptrend'
             elif active_downtrend:
-                intraday.at[idx, 'daily_trend'] = 'downtrend'
+                trend_value = 'downtrend'
+            else:
+                trend_value = None
+                
+            intraday.at[idx, 'daily_trend'] = trend_value
                 
             # Find last peak and trough before current time
             daily_idx = self.data.index.searchsorted(idx)
@@ -455,6 +442,7 @@ class StockTrendAnalyzer:
                 intraday.at[idx, 'last_daily_trough'] = self.data['low'].iloc[last_trough_idx]
         
         return intraday
+
 
     def _is_overlapping(self, start_idx: int, end_idx: int) -> bool:
         """

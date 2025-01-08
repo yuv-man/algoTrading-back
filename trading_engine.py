@@ -34,13 +34,27 @@ class TradingEngine:
         
         # Connect to IBKR
     def _connect(self):
-        """Establish connection to IBKR"""
-        self.app.connect('127.0.0.1', 7497, clientId=1)
-        
-        # Start the connection thread
-        con_thread = threading.Thread(target=self.app.run, daemon=True)
-        con_thread.start()
-        time.sleep(1)  # Give time for connection to establish
+        """Establish connection to IBKR via socket"""
+        try:
+            # Standard socket connection parameters
+            HOST = '127.0.0.1'  # or 'localhost'
+            PORT = 7497         # IB Gateway port (or 7497 for TWS)
+            CLIENT_ID = 1       # Unique client identifier
+    
+            # Connect using socket connection
+            self.app.connect(HOST, PORT, clientId=CLIENT_ID)
+            print(f"Attempting socket connection to {HOST}:{PORT}")
+    
+            # Start the socket client
+            con_thread = threading.Thread(target=self.app.run, daemon=True)
+            con_thread.start()
+            time.sleep(1)  # Give time for connection to establish
+    
+            return True
+    
+        except Exception as e:
+            print(f"Socket connection error: {str(e)}")
+            return False
     
     def create_contract(self, symbol):
         """Create a stock contract"""
@@ -322,7 +336,7 @@ class TradingEngine:
         """Get historical data with error handling"""
 
         def validate_dataframe(df, timeframe):
-            required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+            required_columns = ['open', 'high', 'low', 'close', 'volume']
             missing_cols = [col for col in required_columns if col not in df.columns]
             if missing_cols:
                 raise ValueError(f"Missing columns in {timeframe} data: {missing_cols}")
@@ -331,9 +345,8 @@ class TradingEngine:
                 raise ValueError("No contract set. Call set_strategy() first.")
             elif not self.contract and symbol is not None:
                 self.contract = self.create_contract(symbol)
-            
-            
-            if not self.app.isConnected():
+            print(self.app.is_connected)
+            if not self.app.is_connected:
                 self._connect()
 
             intraday_intervals = ['1 secs', '5 secs', '10 secs', '15 secs', '30 secs',
@@ -353,14 +366,14 @@ class TradingEngine:
                 time.sleep(1)
                 daily_df = self.app.histData(2, self.contract, "1 Y", "1 day")
                 validate_dataframe(daily_df, "daily")
-
+                
                 return intraday_df, daily_df
             else:
                 # For non-intraday intervals, just return the single dataframe
-                if 'Timestamp' in intraday_df.columns:
-                    intraday_df['Timestamp'] = pd.to_datetime(intraday_df['Timestamp'])
-                    intraday_df.set_index('Timestamp', inplace=True)
-                intraday_df.sort_index(inplace=True)
+                if 'timestamp' in intraday_df.columns:
+                    intraday_df['timestamp'] = pd.to_datetime(intraday_df['timestamp'])
+                    intraday_df.set_index('timestamp', inplace=True)
+                    intraday_df.sort_index(inplace=True)
                 return None, intraday_df
     
         except Exception as e:
