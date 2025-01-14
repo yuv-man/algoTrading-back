@@ -39,7 +39,7 @@ class TradingEngine:
             # Standard socket connection parameters
             HOST = '127.0.0.1'  # or 'localhost'
             PORT = 7497         # IB Gateway port (or 7497 for TWS)
-            CLIENT_ID = 1       # Unique client identifier
+            CLIENT_ID = 2       # Unique client identifier
     
             # Connect using socket connection
             self.app.connect(HOST, PORT, clientId=CLIENT_ID)
@@ -88,7 +88,7 @@ class TradingEngine:
                 raise ValueError("Limit price required for LMT orders")
             order.lmtPrice = limit_price
             
-        return order
+        return True
     
     def set_strategy(self, strategy):
         """Set the trading strategy"""
@@ -133,9 +133,13 @@ class TradingEngine:
             print(f"Trade rejected: {message}")
             return False
             
-        order = self.create_order(action, quantity, 'MKT' if price is None else 'LMT', price)
-        self.app.placeOrder(order.orderId, self.contract, order)
-        self.strategy.update_position(action, quantity, price or self.strategy.current_price)
+        #order = self.create_order(action, quantity, 'MKT' if price is None else 'LMT', price)
+        market_id = self.app.place_order(
+            direction=action,
+            quantity=quantity,
+            contract=self.contract
+        )
+        #self.strategy.update_position(action, quantity, price or self.strategy.current_price)
         
         print(f"Order placed: {action} {quantity} shares at {'market price' if price is None else price}")
         return True
@@ -264,9 +268,9 @@ class TradingEngine:
         
         return {'trades': trades, 'max_drawdown': max_drawdown , 'current_portfolio': current_portfolio, 'data': df}
 
-    def start_trading(self, interval):
+    def start_trading(self, symbol, interval):
         """Initialize and start live trading"""
-        if not self.app.isConnected():
+        if not self.app.is_connected:
             self._connect()
 
         self.interval = interval
@@ -280,11 +284,11 @@ class TradingEngine:
             self.strategy.initialize(df)
             
             # Start live trading
-            self.start_live_trading()
+            self.start_live_trading(symbol)
         else:
             raise ValueError("Failed to get historical data")
     
-    def start_live_trading(self):
+    def start_live_trading(self, symbol):
         """Start live trading with the strategy"""
         if not self.strategy:
             raise ValueError("No strategy set. Call set_strategy() first.")
@@ -299,14 +303,14 @@ class TradingEngine:
                 action, quantity, price = self.strategy.generate_trade_decision(current_data)
                 
                 if action:
-                    if self.position == 0:  # No position
+                    if self.positions[symbol] == 0:  # No position
                         if self.execute_trade(action, quantity, price):
-                            stop_price = self.calculate_stop_loss(action, price)
-                            self.place_stop_loss_order(action, quantity, stop_price)
+                            stop_price = self.strategy.calculate_stop_loss(action, price)
+                            self.stop_loss[symbol] = self.place_stop_loss_order(action, quantity, stop_price)
                     else:  # Position exists
                         if self.should_update_position(action):
-                            new_stop_price = self.calculate_stop_loss(action, price)
-                            self.update_stop_loss_order(new_stop_price)
+                            new_stop_price = self.strategy.calculate_stop_loss(action, price)
+                            self.update_stop_loss_order(symbol,quantity, new_stop_price)
                     
             except queue.Empty:
                 continue
@@ -322,15 +326,31 @@ class TradingEngine:
 
     def should_update_position(self, new_action: str) -> bool:
         """Check if position should be updated"""
-        return (self.position > 0 and new_action == "BUY") or \
-               (self.position < 0 and new_action == "SELL")
+        return (self.positions[symbol] > 0 and new_action == "BUY") or \
+               (self.positions[symbol] < 0 and new_action == "SELL")
                
-    def update_stop_loss_order(self, new_stop_price: float):
+    def update_stop_loss_order(self,symbol:str, quantity: float, new_stop_price: float):
         """Update existing stop loss order"""
-        if self.stop_order_id is not None:
-            self.cancelOrder(self.stop_order_id)
-            action = "SELL" if self.position > 0 else "BUY"
-            self.place_stop_loss_order(action, abs(self.position), new_stop_price)
+        if self.stop_order_ids[symbol] is not None:
+            ib.modify_order(
+                order_id=self.stop_order_ids[symbol],
+                new_quantity=quantity,
+                new_limit_price=new_stop_price
+            )            
+
+    def place_stop_loss_order(self, action: str, quantity: float, stop_price: float, 
+                          contract: Contract = None, transmit: bool = True, 
+                          parent_id: int = None) -> int:
+        stop_id = app.place_order(
+            direction=action,
+            quantity=quantity,
+            order_type="STP",
+            stop_price=stop_price,
+            contract=self.contract
+        )
+        return stop_id
+        
+        
     
     def get_historical_data(self, duration="1 D", interval="1 min", symbol=None):
         """Get historical data with error handling"""
@@ -378,4 +398,12 @@ class TradingEngine:
     
         except Exception as e:
             logging.error(f"Error fetching historical data: {str(e)}")
+            raise
+
+    def get_orders(self):
+        try:
+            orders = self.app.request_open_orders()
+            return orders
+        except Exception as e:
+            logging.error(f"Error fetching open orders: {str(e)}")
             raise

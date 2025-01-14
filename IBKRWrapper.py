@@ -1,12 +1,16 @@
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
+from ibapi.order_state import OrderState
+from ibapi.order import Order
 import queue
 import time
 import logging
-from threading import Thread, Lock
+from threading import Thread, Lock, Event
 from datetime import datetime
 import pandas as pd
+from typing import Union, List
+
 
 class IBKRWrapper(EWrapper, EClient):
     def __init__(self):
@@ -28,6 +32,17 @@ class IBKRWrapper(EWrapper, EClient):
         self.reconnect_count = 0
         self.max_reconnect_attempts = 5
         self.reconnect_wait_time = 30  # seconds
+
+        # New data storage for positions and orders
+        self.positions = {}
+        self.open_orders = {}
+        self.completed_orders = {}
+        self.positions_end = False
+        self.orders_end = False
+        
+        # Position and order events
+        self.position_event = Event()
+        self.order_event = Event()
         
         # Initialize logger
         self.logger = logging.getLogger(__name__)
@@ -300,43 +315,400 @@ class IBKRWrapper(EWrapper, EClient):
         super().placeOrder(order_id, contract, order)
         return order_id
 
-    
-    def stopOrder(direction,quantity,st_price):
-        order = Order()
-        order.action = direction
-        order.orderType = "STP"
-        order.totalQuantity = quantity
-        order.auxPrice = st_price
-        return order
-
-    def marketOrder(direction,quantity):
-        order = Order()
-        order.action = direction
-        order.orderType = "MKT"
-        order.totalQuantity = quantity
-        return order
-
-    def create_order(self, action, quantity, order_type='MKT', lmt_price=None):
+    def place_order(self, direction: str, quantity: float, contract: Contract = None,
+                   order_type: str = 'MKT', limit_price: float = None, 
+                   stop_price: float = None, tif: str = 'GTC',
+                   profit_target: float = None, stop_loss: float = None,
+                   transmit: bool = True, oca_group: str = None) -> Union[int, List[int]]:
         """
-        Create an order object
+        Main order placement function that handles all order types
         
         Args:
-            action (str): 'BUY' or 'SELL'
+            direction (str): 'BUY' or 'SELL'
             quantity (float): Number of shares/contracts
-            order_type (str): 'MKT' for Market or 'LMT' for Limit
-            lmt_price (float): Limit price (required for 'LMT' orders)
+            contract (Contract): IB contract object (if None, uses current contract)
+            order_type (str): 'MKT', 'LMT', 'STP', 'STP_LMT', 'BRACKET'
+            limit_price (float): Limit price for limit orders
+            stop_price (float): Stop price for stop orders
+            tif (str): Time in force - 'GTC', 'DAY', 'IOC'
+            profit_target (float): Optional profit target price for bracket orders
+            stop_loss (float): Optional stop loss price for bracket/stop orders
+            transmit (bool): Whether to transmit the order immediately
+            oca_group (str): OCA group name for related orders
+            
+        Returns:
+            Union[int, List[int]]: Order ID(s) of placed order(s)
         """
+        try:
+            if self.next_valid_order_id is None:
+                raise ValueError("No valid order ID received from IBKR")
+                
+            contract = contract or self.contract
+            if contract is None:
+                raise ValueError("No contract specified")
+
+            # Validate inputs
+            direction = direction.upper()
+            order_type = order_type.upper()
+            
+            if direction not in ['BUY', 'SELL']:
+                raise ValueError("Direction must be 'BUY' or 'SELL'")
+            
+            if order_type not in ['MKT', 'LMT', 'STP', 'STP_LMT', 'BRACKET']:
+                raise ValueError("Invalid order type")
+
+            # Handle bracket orders separately
+            if order_type == 'BRACKET':
+                return self._place_bracket_order(
+                    direction=direction,
+                    quantity=quantity,
+                    contract=contract,
+                    entry_price=limit_price,
+                    profit_target=profit_target,
+                    stop_loss=stop_loss,
+                    tif=tif
+                )
+
+            # Create the appropriate order object
+            order = self._create_base_order(
+                direction=direction,
+                quantity=quantity,
+                order_type=order_type,
+                limit_price=limit_price,
+                stop_price=stop_price,
+                tif=tif,
+                transmit=transmit,
+                oca_group=oca_group
+            )
+
+            # Get order ID and increment
+            order_id = self.next_valid_order_id
+            self.next_valid_order_id += 1
+
+            # Place the order
+            self.placeOrder(order_id, contract, order)
+            
+            self.logger.info(
+                f"Order placed - ID: {order_id}, Type: {order_type}, "
+                f"Direction: {direction}, Quantity: {quantity}"
+            )
+            
+            return order_id
+
+        except Exception as e:
+            self.logger.error(f"Error placing order: {str(e)}")
+            raise
+
+    def _create_base_order(self, direction: str, quantity: float, 
+                          order_type: str = 'MKT', limit_price: float = None,
+                          stop_price: float = None, transmit: bool = True, 
+                          tif: str = 'GTC', oca_group: str = None) -> Order:
+        """Internal helper to create base order object"""
         order = Order()
-        order.action = action
-        order.totalQuantity = quantity
+        order.action = direction
+        order.totalQuantity = abs(float(quantity))
         order.orderType = order_type
+        order.transmit = transmit
+        order.tif = tif
         
-        if order_type == 'LMT':
-            if lmt_price is None:
-                raise ValueError("Limit price required for LMT orders")
-            order.lmtPrice = lmt_price
+        # Add prices based on order type
+        if order_type in ['LMT', 'STP_LMT']:
+            if limit_price is None or limit_price <= 0:
+                raise ValueError(f"Limit price required for {order_type} orders")
+            order.lmtPrice = limit_price
+            
+        if order_type in ['STP', 'STP_LMT']:
+            if stop_price is None or stop_price <= 0:
+                raise ValueError(f"Stop price required for {order_type} orders")
+            order.auxPrice = stop_price
+            order.outsideRth = True
+            
+        if oca_group:
+            order.ocaGroup = oca_group
+            order.ocaType = 1  # Cancel all other orders on fill
             
         return order
+
+    def _place_bracket_order(self, direction: str, quantity: float, contract: Contract,
+                           entry_price: float = None, profit_target: float = None,
+                           stop_loss: float = None, tif: str = 'GTC') -> List[int]:
+        """Internal helper to place bracket orders"""
+        order_ids = []
+        exit_direction = 'SELL' if direction == 'BUY' else 'BUY'
+        
+        # Create entry order
+        entry_type = 'LMT' if entry_price is not None else 'MKT'
+        entry_order = self._create_base_order(
+            direction=direction,
+            quantity=quantity,
+            order_type=entry_type,
+            limit_price=entry_price,
+            transmit=False,
+            tif=tif
+        )
+        
+        # Get entry order ID
+        entry_id = self.next_valid_order_id
+        self.next_valid_order_id += 1
+        order_ids.append(entry_id)
+        
+        # Create profit target if specified
+        if profit_target is not None:
+            profit_order = self._create_base_order(
+                direction=exit_direction,
+                quantity=quantity,
+                order_type='LMT',
+                limit_price=profit_target,
+                transmit=False,
+                tif=tif
+            )
+            profit_order.parentId = entry_id
+            
+            profit_id = self.next_valid_order_id
+            self.next_valid_order_id += 1
+            order_ids.append(profit_id)
+            
+            # Place profit target order
+            self.placeOrder(profit_id, contract, profit_order)
+        
+        # Create stop loss if specified
+        if stop_loss is not None:
+            stop_order = self._create_base_order(
+                direction=exit_direction,
+                quantity=quantity,
+                order_type='STP',
+                stop_price=stop_loss,
+                transmit=True,  # Last order can be transmitted
+                tif=tif
+            )
+            stop_order.parentId = entry_id
+            
+            stop_id = self.next_valid_order_id
+            self.next_valid_order_id += 1
+            order_ids.append(stop_id)
+            
+            # Place stop loss order
+            self.placeOrder(stop_id, contract, stop_order)
+        
+        # Place entry order last
+        self.placeOrder(entry_id, contract, entry_order)
+        
+        self.logger.info(
+            f"Bracket order placed - Entry ID: {entry_id}, "
+            f"Direction: {direction}, Quantity: {quantity}"
+        )
+        
+        return order_ids
+
+    def modify_order(self, order_id: int, 
+                    new_quantity: float = None,
+                    new_limit_price: float = None,
+                    new_stop_price: float = None) -> bool:
+        """
+        Modify an existing order
+        
+        Args:
+            order_id (int): ID of the order to modify
+            new_quantity (float): New quantity
+            new_limit_price (float): New limit price
+            new_stop_price (float): New stop price
+            
+        Returns:
+            bool: Success/failure
+        """
+        try:
+            if order_id not in self.open_orders:
+                raise ValueError(f"Order ID {order_id} not found in open orders")
+                
+            existing_order = self.open_orders[order_id]
+            
+            # Create modification order based on existing order
+            modify_order = self._create_base_order(
+                direction=existing_order['action'],
+                quantity=new_quantity or existing_order['totalQuantity'],
+                order_type=existing_order['orderType'],
+                limit_price=new_limit_price or existing_order.get('lmtPrice'),
+                stop_price=new_stop_price or existing_order.get('auxPrice'),
+                tif=existing_order.get('tif', 'GTC')
+            )
+            
+            # Place modification
+            self.placeOrder(order_id, self.contract, modify_order)
+            
+            self.logger.info(f"Order modified - ID: {order_id}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error modifying order: {str(e)}")
+            return False
+
+    def position(self, account: str, contract: Contract, position: float, avgCost: float):
+        """Called when a position is received"""
+        position_data = {
+            'account': account,
+            'symbol': contract.symbol,
+            'secType': contract.secType,
+            'exchange': contract.exchange,
+            'currency': contract.currency,
+            'position': position,
+            'avgCost': avgCost,
+            'marketValue': 0  # Will be updated when we receive market data
+        }
+        
+        key = f"{contract.symbol}_{contract.secType}_{contract.exchange}"
+        self.positions[key] = position_data
+        self.logger.info(f"Position received: {position_data}")
+
+    def positionEnd(self):
+        """Called when all positions have been received"""
+        self.positions_end = True
+        self.position_event.set()
+        self.logger.info("Positions download completed")
+
+    # Order-related callbacks
+    def openOrder(self, orderId: int, contract: Contract, order: Order, orderState: OrderState):
+        """Called when an open order is received"""
+        order_data = {
+            'orderId': orderId,
+            'symbol': contract.symbol,
+            'secType': contract.secType,
+            'exchange': contract.exchange,
+            'action': order.action,
+            'orderType': order.orderType,
+            'totalQuantity': order.totalQuantity,
+            'lmtPrice': order.lmtPrice if hasattr(order, 'lmtPrice') else None,
+            'auxPrice': order.auxPrice if hasattr(order, 'auxPrice') else None,
+            'status': orderState.status,
+            'filled': order.filledQuantity if hasattr(order, 'filledQuantity') else 0,
+            'remaining': order.remainingQuantity if hasattr(order, 'remainingQuantity') else order.totalQuantity,
+            'avgFillPrice': orderState.avgFillPrice,
+            'lastFillPrice': orderState.lastFillPrice,
+            'whyHeld': orderState.whyHeld,
+            'timestamp': datetime.now()
+        }
+        
+        self.open_orders[orderId] = order_data
+        self.logger.info(f"Open order received: {order_data}")
+
+    def openOrderEnd(self):
+        """Called when all open orders have been received"""
+        self.orders_end = True
+        self.order_event.set()
+        self.logger.info("Open orders download completed")
+
+    def orderStatus(self, orderId: int, status: str, filled: float, remaining: float,
+                   avgFillPrice: float, permId: int, parentId: int, lastFillPrice: float,
+                   clientId: int, whyHeld: str, mktCapPrice: float):
+        """Called when the status of an order changes"""
+        if orderId in self.open_orders:
+            self.open_orders[orderId].update({
+                'status': status,
+                'filled': filled,
+                'remaining': remaining,
+                'avgFillPrice': avgFillPrice,
+                'lastFillPrice': lastFillPrice,
+                'whyHeld': whyHeld
+            })
+            
+            # If order is completed, move it to completed_orders
+            if status in ['Filled', 'Cancelled', 'Inactive']:
+                self.completed_orders[orderId] = self.open_orders.pop(orderId)
+                
+        self.logger.info(f"Order status update - ID: {orderId}, Status: {status}")
+
+    # Methods to request position and order data
+    def request_positions(self, timeout=30):
+        """
+        Request all current positions
+        Returns a DataFrame of positions after receiving all data
+        """
+        try:
+            # Reset position data and event
+            self.positions = {}
+            self.positions_end = False
+            self.position_event.clear()
+            
+            # Request positions
+            self.reqPositions()
+            
+            # Wait for positions with timeout
+            if not self.position_event.wait(timeout):
+                raise TimeoutError("Position request timed out")
+                
+            if not self.positions:
+                self.logger.warning("No positions found")
+                return pd.DataFrame()
+                
+            # Convert positions to DataFrame
+            df = pd.DataFrame(self.positions.values())
+            
+            # Add market value (you might want to request market data separately)
+            return df
+            
+        except Exception as e:
+            self.logger.error(f"Error requesting positions: {str(e)}")
+            raise
+
+    def request_open_orders(self, timeout=30):
+        """
+        Request all open orders
+        Returns a DataFrame of open orders after receiving all data
+        """
+        try:
+            # Reset order data and event
+            self.open_orders = {}
+            self.orders_end = False
+            self.order_event.clear()
+            
+            # Request open orders
+            self.reqOpenOrders()
+            
+            # Wait for orders with timeout
+            if not self.order_event.wait(timeout):
+                raise TimeoutError("Open orders request timed out")
+                
+            if not self.open_orders:
+                self.logger.warning("No open orders found")
+                return pd.DataFrame()
+                
+            # Convert orders to DataFrame
+            df = pd.DataFrame(self.open_orders.values())
+            return df
+            
+        except Exception as e:
+            self.logger.error(f"Error requesting open orders: {str(e)}")
+            raise
+
+    def get_completed_orders(self):
+        """
+        Get all completed orders
+        Returns a DataFrame of completed orders
+        """
+        if not self.completed_orders:
+            return pd.DataFrame()
+            
+        return pd.DataFrame(self.completed_orders.values())
+
+    def get_all_orders(self):
+        """
+        Get all orders (both open and completed)
+        Returns a DataFrame of all orders
+        """
+        all_orders = {**self.open_orders, **self.completed_orders}
+        if not all_orders:
+            return pd.DataFrame()
+            
+        df = pd.DataFrame(all_orders.values())
+        return df
+
+    def get_position_value(self, symbol):
+        """
+        Get the current position and value for a specific symbol
+        """
+        for key, pos in self.positions.items():
+            if pos['symbol'] == symbol:
+                return pos
+        return None
 
     def data_to_dataframe(self):
         """Convert historical data to pandas DataFrame"""

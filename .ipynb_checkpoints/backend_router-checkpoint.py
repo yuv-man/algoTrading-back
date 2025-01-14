@@ -1,12 +1,15 @@
 from flask import Flask, request, jsonify
+from flask_socketio import SocketIO, emit
 from flask_cors import CORS
 from dataclasses import dataclass, asdict
 from datetime import datetime
-import threading
+from threading import Thread
 from typing import Dict, Any, Optional
 import logging
 from trading_engine import TradingEngine
 from tradingApp import TradingApplication
+import random #to delete
+import time
 
 
 # Configure logging
@@ -24,6 +27,7 @@ CORS(app, resources={
         "allow_headers": ["Content-Type"]
     }
 })
+socketio = SocketIO(app, cors_allowed_origins="*")
 
 trading_engine = TradingEngine()
 trading_app = TradingApplication()
@@ -49,7 +53,7 @@ def validate_strategy_params(strategy_type: str, params: Dict[str, Any]) -> tupl
             return False, "Window parameters must be positive integers"
     return True, None
 
-@app.route('/register_strategy', methods=['POST'])
+@app.route('/api/register_strategy', methods=['POST'])
 def register_strategy():
     """Register a new trading strategy with parameter validation."""
     logger.debug("Received request to register strategy")
@@ -84,7 +88,7 @@ def register_strategy():
         logger.error(f"Error registering strategy: {str(e)}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-@app.route('/backtest', methods=['POST'])
+@app.route('/api/backtest', methods=['POST'])
 def backtest():
     """Run strategy backtest with proper validation and error handling."""
     try:
@@ -126,7 +130,7 @@ def backtest():
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
-@app.route('/get_stock_data', methods=['POST'])
+@app.route('/api/get_stock_data', methods=['POST'])
 def get_stock_data():
     """
     Fetch market data based on time parameters.
@@ -259,7 +263,7 @@ def get_stock_data():
             'message': f'Internal server error: {str(e)}'
         }), 500
 
-@app.route('/start_trading', methods=['POST'])
+@app.route('/api/start_trading', methods=['POST'])
 def start_trading():
     """Start live trading with connection management and error handling."""
     try:
@@ -301,7 +305,7 @@ def start_trading():
         logger.error(f"Error starting trading: {str(e)}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-@app.route('/stop_trading', methods=['POST'])
+@app.route('/api/stop_trading', methods=['POST'])
 def stop_trading():
     """Stop live trading with state validation."""
     try:
@@ -326,7 +330,7 @@ def stop_trading():
         logger.error(f"Error stopping trading: {str(e)}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-@app.route('/get_strategies', methods=['GET'])
+@app.route('/api/get_strategies', methods=['GET'])
 def get_strategies():
     """Get all strategies and their parameters"""
     try:
@@ -343,7 +347,7 @@ def get_strategies():
         return jsonify({'status': 'error', 'message': str(e)}), 500
         
 
-@app.route('/get_performance', methods=['GET'])
+@app.route('/api/get_performance', methods=['GET'])
 def get_performance():
     """Get current strategy performance with detailed metrics."""
     try:
@@ -373,7 +377,7 @@ def get_performance():
         logger.error(f"Error getting performance: {str(e)}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-@app.route('/optimize_strategy', methods=['POST'])
+@app.route('/api/optimize_strategy', methods=['POST'])
 def optimize_strategy():
     """
     Fetch market data based on time parameters.
@@ -442,6 +446,73 @@ def optimize_strategy():
             'message': f'Internal server error: {str(e)}'
         }), 500
 
+@app.route('/api/orders', methods=['GET'])
+def get_orders():
+    """Get current strategy performance with detailed metrics."""
+    try:
+        if not trading_engine.strategy:
+            return jsonify({
+                'status': 'error',
+                'message': 'No strategy registered'
+            }), 400
+        
+        orders = trading_engine.get_orders(symbol)
+        
+        return jsonify({
+            'status': 'success',
+            'orders': orders
+        })
+        
+    except Exception as e:
+        logger.error(f"Error getting orders: {str(e)}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/watchlist', methods=['GET'])
+def get_positions():
+    """Get current strategy performance with detailed metrics."""
+    try:
+        if not trading_engine.strategy:
+            return jsonify({
+                'status': 'error',
+                'message': 'No strategy registered'
+            }), 400
+        
+        positions = trading_engine.get_positions()
+        
+        return jsonify({
+            'status': 'success',
+            'watchlist': positions
+        })
+        
+    except Exception as e:
+        logger.error(f"Error getting positions: {str(e)}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+def generate_trading_data():
+    while True:
+        trading_data = {
+            'symbol': 'BTC/USD',
+            'price': round(random.uniform(30000, 40000), 2),
+            'volume': round(random.uniform(100, 1000), 2),
+            'timestamp': int(time.time())
+        }
+        socketio.emit('trading_update', trading_data)
+        time.sleep(1)  # Send updates every second
+
+@socketio.on('connect')
+def handle_connect():
+    print('Client connected')
+    emit('connected', {'data': 'Connected to trading websocket server'})
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print('Client disconnected')
+
+@socketio.on('subscribe')
+def handle_subscribe(symbol):
+    print(f'Client subscribed to {symbol}')
+    emit('subscribed', {'symbol': symbol})
+
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({'status': 'error', 'message': 'Endpoint not found'}), 404
@@ -450,5 +521,24 @@ def not_found(error):
 def method_not_allowed(error):
     return jsonify({'status': 'error', 'message': 'Method not allowed'}), 405
 
+@socketio.on('connect')
+def handle_connect():
+    print('Client connected')
+    emit('connected', {'data': 'Connected to trading websocket server'})
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print('Client disconnected')
+
+@socketio.on('subscribe')
+def handle_subscribe(symbol):
+    print(f'Client subscribed to {symbol}')
+    emit('subscribed', {'symbol': symbol})
+
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5001)
+    # Start the trading data generator in a separate thread
+    trading_thread = Thread(target=generate_trading_data)
+    trading_thread.daemon = True
+    trading_thread.start()
+    
+    socketio.run(app, debug=True, port=5001)

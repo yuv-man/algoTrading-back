@@ -51,7 +51,7 @@ class TradingApplication:
         self.peaks= None 
         self.troughs = None
         self.saveHistoricalDataToCSV = False
-        self.loadHistoricalDataFromCSV = False
+        self.loadHistoricalDataFromCSV = True
 
     def register_strategy(self, symbol, strategy_type: str, params: Dict[str, Any], sec_type: str = "STK", currency: str = "USD", 
                  exchange: str = "SMART") -> Dict:
@@ -108,8 +108,8 @@ class TradingApplication:
             
         try:
             if self.loadHistoricalDataFromCSV:
-                csv_path_intraday = 'stock_data_MSFT/MSFT_None_to_20241222 12:53:03_intraday.csv'
-                csv_path_daily = 'stock_data_MSFT/MSFT_None_to_20241222 12:53:03_daily.csv'
+                csv_path_intraday = 'stock_data_SPY/SPY_20250107 12:38:01_to_20250108 12:38:01_intraday.csv'
+                csv_path_daily = 'stock_data_SPY/SPY_20250107 12:38:01_to_20250108 12:38:01_daily.csv'
                 self.intraday_data = self.load_historical_data(csv_path=csv_path_intraday)
                 self.daily_data = self.load_historical_data(csv_path=csv_path_daily)
 
@@ -147,8 +147,8 @@ class TradingApplication:
                 return {'status': 'error', 'message': 'No strategy registered'}
 
             if self.loadHistoricalDataFromCSV:
-                csv_path_intraday = 'stock_data_MSFT/MSFT_None_to_20241222 12:53:03_intraday.csv'
-                csv_path_daily = 'stock_data_MSFT/MSFT_None_to_20241222 12:53:03_daily.csv'
+                csv_path_intraday = 'stock_data_SPY/SPY_20250107 12:38:01_to_20250108 12:38:01_intraday.csv'
+                csv_path_daily = 'stock_data_SPY/SPY_20250107 12:38:01_to_20250108 12:38:01_daily.csv'
                 self.intraday_data = self.load_historical_data(csv_path=csv_path_intraday)
                 self.daily_data = self.load_historical_data(csv_path=csv_path_daily)
             # Get historical data using trading engine
@@ -609,7 +609,7 @@ class TradingApplication:
             df = pd.read_csv(csv_path)
             
             # Check required columns
-            required_columns = ['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']
+            required_columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
             missing_columns = [col for col in required_columns if col not in df.columns]
             if missing_columns:
                 raise ValueError(f"Missing required columns: {missing_columns}")

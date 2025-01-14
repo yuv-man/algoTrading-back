@@ -4,6 +4,7 @@ import xgboost as xgb
 from ib_insync import *
 import datetime as dt
 import time
+from typing import List, Dict
 
 class AITradingBot:
     def __init__(self, symbol='AAPL', timeframe='1 min', lookback_period=20):
@@ -17,7 +18,7 @@ class AITradingBot:
         # Connect to Interactive Brokers
         self.ib = IB()
         try:
-            self.ib.connect('127.0.0.1', 7497, clientId=1)
+            self.ib.connect('127.0.0.1', 7497, clientId=3)
             print("Successfully connected to IBKR")
         except Exception as e:
             print(f"Failed to connect to IBKR: {e}")

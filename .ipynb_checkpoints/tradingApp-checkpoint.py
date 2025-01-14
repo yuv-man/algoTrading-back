@@ -7,6 +7,7 @@ import time
 import pandas as pd
 from ibapi.contract import Contract
 from strategies import *
+from IBKRWrapper import IBKRWrapper
 from trading_engine import TradingEngine
 from trendAnalyzer import StockTrendAnalyzer
 from strategyValidator import StrategyValidator, StrategyHandler
@@ -45,6 +46,10 @@ class TradingApplication:
         self.position_size = 100000
         self.max_drawdown = 0
         self.trades = None
+        self.uptrends = None
+        self.downtrends = None
+        self.peaks= None 
+        self.troughs = None
         self.saveHistoricalDataToCSV = False
         self.loadHistoricalDataFromCSV = True
 
@@ -103,8 +108,8 @@ class TradingApplication:
             
         try:
             if self.loadHistoricalDataFromCSV:
-                csv_path_intraday = 'stock_data_MSFT/MSFT_None_to_20241222 12:53:03_intraday.csv'
-                csv_path_daily = 'stock_data_MSFT/MSFT_None_to_20241222 12:53:03_daily.csv'
+                csv_path_intraday = 'stock_data_SPY/SPY_20250107 12:38:01_to_20250108 12:38:01_intraday.csv'
+                csv_path_daily = 'stock_data_SPY/SPY_20250107 12:38:01_to_20250108 12:38:01_daily.csv'
                 self.intraday_data = self.load_historical_data(csv_path=csv_path_intraday)
                 self.daily_data = self.load_historical_data(csv_path=csv_path_daily)
 
@@ -115,8 +120,8 @@ class TradingApplication:
                         interval=self.interval,
                         symbol=symbol
                     )
-            
             intra_day_data_with_trends = self.daily_trends_analyze()
+            print(intra_day_data_with_trends)
             return {'intraday_data': intra_day_data_with_trends, 'daily_data': self.daily_data}         
 
         except Exception as e:
@@ -142,8 +147,8 @@ class TradingApplication:
                 return {'status': 'error', 'message': 'No strategy registered'}
 
             if self.loadHistoricalDataFromCSV:
-                csv_path_intraday = 'stock_data_MSFT/MSFT_None_to_20241222 12:53:03_intraday.csv'
-                csv_path_daily = 'stock_data_MSFT/MSFT_None_to_20241222 12:53:03_daily.csv'
+                csv_path_intraday = 'stock_data_SPY/SPY_20250107 12:38:01_to_20250108 12:38:01_intraday.csv'
+                csv_path_daily = 'stock_data_SPY/SPY_20250107 12:38:01_to_20250108 12:38:01_daily.csv'
                 self.intraday_data = self.load_historical_data(csv_path=csv_path_intraday)
                 self.daily_data = self.load_historical_data(csv_path=csv_path_daily)
             # Get historical data using trading engine
@@ -451,7 +456,7 @@ class TradingApplication:
         """Start live trading"""
         self.interval = interval
         try:
-            result = self.trading_engine.start_trading(self.interval)
+            result = self.trading_engine.start_trading(self.symbol, self.interval)
             logger.info("Live trading started")
             return {
                 'status': 'success',
@@ -543,7 +548,6 @@ class TradingApplication:
                 raise ValueError(f"Invalid period format: {period}")
             
             self.start_date = start.strftime('%Y%m%d %H:%M:%S')
-            self.start_date = None
             self.end_date = end.strftime('%Y%m%d %H:%M:%S') 
             return period
         
@@ -605,7 +609,7 @@ class TradingApplication:
             df = pd.read_csv(csv_path)
             
             # Check required columns
-            required_columns = ['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']
+            required_columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
             missing_columns = [col for col in required_columns if col not in df.columns]
             if missing_columns:
                 raise ValueError(f"Missing required columns: {missing_columns}")
@@ -647,6 +651,7 @@ class TradingApplication:
         analyzer = StockTrendAnalyzer(self.symbol, self.daily_data)
         self.peaks, self.troughs = analyzer.find_peaks_and_troughs()
         self.uptrends, self.downtrends, self.daily_data = analyzer.identify_trends()
+
         #plt = analyzer.visualize_trends()
         #plt.show()
         if self.intraday_data is not None:
