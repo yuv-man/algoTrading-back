@@ -7,6 +7,7 @@ from baseStrategy import BaseStrategy
 import xgboost as xgb
 from datetime import datetime
 import logging
+from sklearn.preprocessing import StandardScaler
 
 
 class MACDStochStrategy(BaseStrategy):
@@ -413,70 +414,135 @@ class VWAPStrategy(BaseStrategy):
 
 
 class XGBoostStrategy(BaseStrategy):
-    def __init__(self, symbol: str, lookback_period: int = 20):
-        """
-        Initialize XGBoost trading strategy
-        
-        Args:
-            symbol (str): Trading symbol
-            lookback_period (int): Number of periods for technical indicators
-        """
-        self.symbol = symbol
-        self.lookback_period = lookback_period
-        self.model = None
-        self.position = 0
-        self.current_price = 0
-        self.portfolio_value = 0
+    def __init__(self, symbol: str, lookback_period: int = 60):
+        super().__init__(symbol, lookback_period)
+        # Set up logging
+        import logging
         self.logger = logging.getLogger(__name__)
+        self.logger.setLevel(logging.INFO)
+        # Add handler if none exists
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
         
-        # Stop loss settings
-        self.trailing_stop = False
-        self.stop_loss_pct = 0.02  # 2% fixed stop loss
-        self.trailing_stop_pct = 0.03  # 3% trailing stop
-        self.current_stop_loss = None
-        self.highest_price_since_entry = None
-        self.lowest_price_since_entry = None
+        # Model parameters
+        self.model = None
+        self.feature_columns = [
+            'returns_15', 'returns_30', 'returns_60',
+            'trend_strength', 'atr_ratio', 'volume_trend',
+            'rsi', 'rsi_trend', 'macd_hist',
+            'momentum', 'trend_quality', 'price_strength'
+        ]
+        # Adjusted risk parameters for longer intraday holds
+        self.stop_loss_pct = 0.005  # 0.5% stop loss
+        self.trailing_stop_pct = 0.007  # 0.7% trailing stop
+        self.profit_target_pct = 0.012  # 1.2% profit target
+        self.max_position_holding_minutes = 240  # Maximum 4 hour hold
+        self.position_entry_time = None
+        
+        # Trade frequency controls
+        self.min_trades_spacing_minutes = 60  # Minimum time between trades
+        self.last_trade_time = None
+        self.min_setup_strength = 0.8  # Higher threshold for trade setup quality
+        
+    def _create_target(self, data: pd.DataFrame, forward_window: int = 20) -> pd.Series:
+        """
+        Create target variable for model training
+        Returns 1 for profitable trades, 0 for unprofitable
+        """
+        future_returns = data['close'].shift(-forward_window) / data['close'] - 1
+        # Adjusted for intraday - looking for moves >= 0.5%
+        return (future_returns > 0.005).astype(int)
 
-    def prepare_features(self, data: pd.DataFrame) -> pd.DataFrame:
+    def train_model(self, data: pd.DataFrame) -> None:
         """
-        Calculate technical indicators as features
-        
-        Args:
-            data (pd.DataFrame): Price data with OHLCV columns
-        
-        Returns:
-            pd.DataFrame: DataFrame with technical indicators
+        Train XGBoost model on historical data with enhanced features
         """
-        df = data.copy()
-        
-        # Calculate basic technical indicators
-        df['returns'] = df['close'].pct_change()
-        df['sma_20'] = df['close'].rolling(window=20).mean()
-        df['rsi'] = self._calculate_rsi(df['close'])
-        
-        # Calculate MACD
-        exp1 = df['close'].ewm(span=12, adjust=False).mean()
-        exp2 = df['close'].ewm(span=26, adjust=False).mean()
-        df['macd'] = exp1 - exp2
-        df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-        df['macd_hist'] = df['macd'] - df['macd_signal']
-        
-        # Calculate Bollinger Bands
-        df['bb_middle'] = df['close'].rolling(window=20).mean()
-        bb_std = df['close'].rolling(window=20).std()
-        df['bb_upper'] = df['bb_middle'] + 2 * bb_std
-        df['bb_lower'] = df['bb_middle'] - 2 * bb_std
-        df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle']
-        df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
-        
-        # Additional features from Bollinger Bands
-        df['price_above_upper'] = (df['close'] > df['bb_upper']).astype(int)
-        df['price_below_lower'] = (df['close'] < df['bb_lower']).astype(int)
-        
-        # Create target variable (1 for price increase, 0 for decrease)
-        df['target'] = (df['returns'].shift(-1) > 0).astype(int)
-        
-        return df
+        try:
+            df = self.prepare_features(data)
+            
+            # Create target variable
+            df['target'] = self._create_target(df)
+            
+            # Remove last forward_window rows as they won't have valid targets
+            df = df.iloc[:-20]
+            
+            # Handle missing values
+            df = df.replace([np.inf, -np.inf], np.nan)
+            df = df.ffill().bfill()
+            
+            # Select features and target
+            X = df[self.feature_columns]
+            y = df['target']
+            
+            # Check for sufficient data
+            if len(X) < 100:  # Minimum required samples
+                raise ValueError("Insufficient data for training")
+            
+            # Handle class imbalance
+            from sklearn.utils.class_weight import compute_class_weight
+            class_weights = compute_class_weight(
+                'balanced',
+                classes=np.unique(y),
+                y=y
+            )
+            weight_dict = dict(zip(np.unique(y), class_weights))
+            
+            # Initialize and train XGBoost model
+            self.model = xgb.XGBClassifier(
+                objective='binary:logistic',
+                n_estimators=100,
+                max_depth=4,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                scale_pos_weight=weight_dict[1]/weight_dict[0],
+                tree_method='hist',
+                eval_metric=['auc', 'error'],
+                random_state=42
+            )
+            
+            # Train without splitting for intraday updates
+            self.model.fit(X, y)
+            
+            # Log feature importance
+            importance = pd.DataFrame({
+                'feature': self.feature_columns,
+                'importance': self.model.feature_importances_
+            })
+            self.logger.info(f"Feature importance:\n{importance.sort_values('importance', ascending=False)}")
+            
+        except Exception as e:
+            self.logger.error(f"Error in train_model: {str(e)}")
+            raise
+
+    def predict(self, data: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Generate predictions and probabilities from the model
+        """
+        try:
+            if self.model is None:
+                raise ValueError("Model not trained")
+                
+            # Prepare features
+            df = self.prepare_features(data)
+            X = df[self.feature_columns].iloc[-1:]
+            
+            # Handle missing values
+            X = X.replace([np.inf, -np.inf], np.nan)
+            X = X.ffill().bfill()
+            
+            # Generate predictions and probabilities
+            predictions = self.model.predict(X)
+            probabilities = self.model.predict_proba(X)
+            
+            return predictions, probabilities
+            
+        except Exception as e:
+            self.logger.error(f"Error in predict: {str(e)}")
+            raise
 
     def _calculate_rsi(self, prices: pd.Series, period: int = 14) -> pd.Series:
         """Calculate Relative Strength Index"""
@@ -486,131 +552,204 @@ class XGBoostStrategy(BaseStrategy):
         rs = gain / loss
         return 100 - (100 / (1 + rs))
 
-    def train_model(self, data: pd.DataFrame) -> None:
-        """
-        Train XGBoost model on historical data
+    def _calculate_atr(self, data: pd.DataFrame, period: int = 14) -> pd.Series:
+        """Calculate Average True Range"""
+        high = data['high']
+        low = data['low']
+        close = data['close']
         
-        Args:
-            data (pd.DataFrame): Processed data with features
-        """
-        try:
-            df = data.dropna()
-            
-            # Define features for training
-            feature_columns = [
-                'returns', 'sma_20', 'rsi', 'macd', 'macd_signal', 'macd_hist',
-                'bb_width', 'bb_position', 'price_above_upper', 'price_below_lower'
-            ]
-            X = df[feature_columns]
-            y = df['target']
-            
-            # Train XGBoost model
-            self.model = xgb.XGBClassifier(
-                objective='binary:logistic',
-                n_estimators=100,
-                max_depth=3,
-                learning_rate=0.1
-            )
-            self.model.fit(X, y)
-            
-        except Exception as e:
-            self.logger.error(f"Error training model: {str(e)}")
-            raise
+        tr1 = high - low
+        tr2 = abs(high - close.shift())
+        tr3 = abs(low - close.shift())
+        
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        return tr.rolling(window=period).mean()
 
+
+    def prepare_features(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Calculate technical indicators for swing-style intraday trading"""
+        df = data.copy()
+        
+        # Price action features
+        df['returns_15'] = df['close'].pct_change(15)
+        df['returns_30'] = df['close'].pct_change(30)
+        df['returns_60'] = df['close'].pct_change(60)
+        
+        # Trend detection (longer periods)
+        for period in [20, 50, 100]:
+            df[f'ema_{period}'] = df['close'].ewm(span=period, adjust=False).mean()
+        
+        # Trend strength
+        df['trend_strength'] = (
+            (df['ema_20'] > df['ema_50']).astype(int) + 
+            (df['ema_50'] > df['ema_100']).astype(int)
+        )
+        
+        # Volatility measures
+        df['atr'] = self._calculate_atr(df, period=14)
+        df['atr_ratio'] = df['atr'] / df['atr'].rolling(100).mean()
+        
+        # Volume analysis (longer periods)
+        df['volume_ma_30'] = df['volume'].rolling(30).mean()
+        df['volume_ma_60'] = df['volume'].rolling(60).mean()
+        df['volume_trend'] = df['volume_ma_30'] / df['volume_ma_60']
+        
+        # RSI with standard period
+        df['rsi'] = self._calculate_rsi(df['close'], period=14)
+        df['rsi_ma'] = df['rsi'].rolling(window=10).mean()
+        df['rsi_trend'] = (df['rsi'] > df['rsi_ma']).astype(int)
+        
+        # MACD (standard settings)
+        exp12 = df['close'].ewm(span=12, adjust=False).mean()
+        exp26 = df['close'].ewm(span=26, adjust=False).mean()
+        df['macd'] = exp12 - exp26
+        df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+        df['macd_hist'] = df['macd'] - df['macd_signal']
+        
+        # Momentum and trend quality
+        df['momentum'] = df['close'] / df['close'].shift(30) - 1
+        df['trend_quality'] = (
+            df['close'].rolling(20).std() / 
+            df['close'].rolling(20).mean()
+        )
+        
+        # Support/Resistance levels
+        df['pivot'] = (df['high'] + df['low'] + df['close']) / 3
+        df['r1'] = 2 * df['pivot'] - df['low']
+        df['s1'] = 2 * df['pivot'] - df['high']
+        
+        # Price position relative to key levels
+        df['price_strength'] = (
+            (df['close'] > df['pivot']).astype(int) +
+            (df['close'] > df['r1']).astype(int) -
+            (df['close'] < df['s1']).astype(int)
+        )
+        
+        return df
+        
+    def _calculate_setup_strength(self, row) -> float:
+        """Calculate overall trade setup strength"""
+        strength_factors = [
+            1 if row['trend_strength'] >= 1 else 0.5,  # Relaxed trend requirement
+            1 if 20 < row['rsi'] < 80 else 0.5,  # Wider RSI range
+            1 if row['volume_trend'] > 0.8 else 0.6,  # Lower volume requirement
+            1 if abs(row['momentum']) > 0.001 else 0.7,  # Lower momentum requirement
+            1 if row['macd_hist'] * row['momentum'] > 0 else 0.5  # Alignment check
+        ]
+        return sum(strength_factors) / len(strength_factors)
+        
     def calculate_signals(self, data: pd.DataFrame) -> pd.DataFrame:
-        """
-        Generate trading signals from model predictions
-        
-        Args:
-            data (pd.DataFrame): Current market data
-        
-        Returns:
-            pd.DataFrame: Data with trading signals (-1 sell, 0 hold, 1 buy)
-        """
         try:
             df = self.prepare_features(data)
-            features = df[[
-                'returns', 'sma_20', 'rsi', 'macd', 'macd_signal', 'macd_hist',
-                'bb_width', 'bb_position', 'price_above_upper', 'price_below_lower'
-            ]].dropna()
+            df['setup_strength'] = df.apply(self._calculate_setup_strength, axis=1)
             
-            if len(features) == 0:
-                return pd.DataFrame()
-                
-            predictions = self.model.predict(features)
-            probabilities = self.model.predict_proba(features)
+            # Initialize prediction columns with NaN
+            df['prediction'] = np.nan
+            df['confidence'] = np.nan
+            df['signal'] = 0
             
-            # Generate trade signals (1 for buy, -1 for sell, 0 for hold)
-            df['confidence'] = [prob[1] for prob in probabilities]
-            df['prediction'] = predictions
+            # Minimum bars needed for initial training
+            min_training_bars = 100
             
-            # Add hold signals based on confidence threshold and current position
-            confidence_threshold = 0.6
-            df['trade_signal'] = 0  # Default to hold
+            if len(df) < min_training_bars * 2:  # Need enough data for both training and testing
+                self.logger.warning(f"Not enough data for training and testing. Need at least {min_training_bars * 2} bars")
+                return df
             
-            # Buy signals (high confidence and price near lower band)
-            df.loc[(df['prediction'] == 1) & 
-                  (df['confidence'] > confidence_threshold), 'trade_signal'] = 1
+            # Create target variable
+            df['target'] = self._create_target(df)
             
-            # Sell signals (low confidence or price near upper band)
-            df.loc[(df['prediction'] == 0) & 
-                  (df['confidence'] > confidence_threshold), 'trade_signal'] = -1
+            # Initial training window
+            training_size = int(len(df) * 0.6)  # Use 60% of data for initial training
+            
+            # Train on initial window
+            train_data = df.iloc[:training_size]
+            self.train_model(train_data)
+            
+            if self.model is not None:
+                # Generate predictions for remaining data
+                for i in range(training_size, len(df)):
+                    # Prepare features for current bar
+                    current_features = df[self.feature_columns].iloc[i:i+1]
+                    current_features = current_features.replace([np.inf, -np.inf], np.nan)
+                    current_features = current_features.ffill().bfill()
+                    
+                    # Generate prediction for current bar
+                    prediction = self.model.predict(current_features)[0]
+                    probability = self.model.predict_proba(current_features)[0][1]
+                    
+                    # Store prediction and confidence
+                    df.iloc[i, df.columns.get_loc('prediction')] = prediction
+                    df.iloc[i, df.columns.get_loc('confidence')] = probability
+                    
+                    # Check conditions for signals
+                    trend_ok = df['trend_strength'].iloc[i] >= 1
+                    volume_ok = df['volume_trend'].iloc[i] > 0.8
+                    
+                    # Generate signals based on conditions
+                    if (prediction == 1 and 
+                        probability > 0.55 and 
+                        trend_ok and 
+                        volume_ok):
+                        df.iloc[i, df.columns.get_loc('signal')] = 1
+                        self.logger.info(f"Buy signal generated at index {df.index[i]} with confidence: {probability:.2f}")
+                        
+                    elif (prediction == 0 and 
+                          probability > 0.55):
+                        df.iloc[i, df.columns.get_loc('signal')] = -1
+                        self.logger.info(f"Sell signal generated at index {df.index[i]} with confidence: {probability:.2f}")
+                    
+                    # Retrain model periodically (every 20 bars)
+                    if (i - training_size) % 20 == 0 and i > training_size:
+                        # Use expanding window for retraining
+                        train_data = df.iloc[:i]
+                        self.train_model(train_data)
             
             return df
-            
-        except Exception as e:
-            self.logger.error(f"Error calculating signals: {str(e)}")
-            raise
-
-    def generate_trade_decision(self, current_data: pd.DataFrame) -> Tuple[Optional[str], Optional[float], Optional[float]]:
-        """
-        Generate trading decision based on current market data
-        
-        Returns:
-            Tuple[str, float, float]: (action, quantity, price)
-        """
-        try:
-            # Check stop loss first if in position
-            current_price = current_data['close'].iloc[-1]
-            if self.position != 0 and self.check_stop_loss(current_price):
-                return self._exit_position()
-            
-            # Update trailing stop if needed
-            self._update_trailing_stop(current_price)
-            
-            # Prepare features and get prediction
-            df = self.prepare_features(current_data.tail(self.lookback_period + 1))
-            features = df[[
-                'returns', 'sma_20', 'rsi', 'macd', 'macd_signal', 'macd_hist',
-                'bb_width', 'bb_position', 'price_above_upper', 'price_below_lower'
-            ]].iloc[-1:]
-            
-            if features.isnull().any().any():
-                return None, None, None
                 
-            prediction = self.model.predict(features)[0]
-            confidence = self.model.predict_proba(features)[0][prediction]
+        except Exception as e:
+            self.logger.error(f"Error in calculate_signals: {str(e)}")
+            raise
+        
+    def generate_trade_decision(self, current_data: pd.DataFrame) -> Tuple[Optional[str], Optional[float], Optional[float]]:
+        try:
+            current_time = pd.Timestamp.now()
+            current_price = current_data['close'].iloc[-1]
             
-            self.current_price = current_price
+            # Check minimum time between trades
+            if self.last_trade_time and (current_time - self.last_trade_time).total_seconds() / 60 < self.min_trades_spacing_minutes:
+                return None, None, None
             
-            # Define action based on prediction and current position
-            action = None
-            quantity = None
+            # Position management
+            if self.position != 0:
+                # Check holding time
+                if self.position_entry_time:
+                    minutes_held = (current_time - self.position_entry_time).total_seconds() / 60
+                    if minutes_held >= self.max_position_holding_minutes:
+                        return self._exit_position()
+                
+                # Check profit target
+                if self.position > 0 and current_price >= self.entry_price * (1 + self.profit_target_pct):
+                    return self._exit_position()
+                elif self.position < 0 and current_price <= self.entry_price * (1 - self.profit_target_pct):
+                    return self._exit_position()
             
-            if prediction == 1 and confidence > 0.6 and self.position <= 0:
-                action = "BUY"
-                quantity = self._calculate_position_size(confidence)
-                self._initialize_stop_loss(current_price, "BUY")
-            elif prediction == 0 and confidence > 0.6 and self.position >= 0:
-                action = "SELL"
-                quantity = self._calculate_position_size(confidence)
-                self._initialize_stop_loss(current_price, "SELL")
+            # Signal processing
+            signals = self.calculate_signals(current_data)
+            latest_signal = signals['signal'].iloc[-1]
             
-            return action, quantity, current_price
+            if latest_signal != 0 and signals['setup_strength'].iloc[-1] >= self.min_setup_strength:
+                action = "BUY" if latest_signal > 0 else "SELL"
+                quantity = self._calculate_position_size(signals['confidence'].iloc[-1])
+                self._initialize_stop_loss(current_price, action)
+                self.position_entry_time = current_time
+                self.last_trade_time = current_time
+                return action, quantity, current_price
+            
+            return None, None, None
             
         except Exception as e:
             self.logger.error(f"Error generating trade decision: {str(e)}")
-            return None, None, None
+            return None, None, None        
 
     def _exit_position(self) -> Tuple[str, float, float]:
         """Exit current position"""
@@ -660,9 +799,7 @@ class XGBoostStrategy(BaseStrategy):
             return current_price > self.current_stop_loss
 
     def calculate_stop_loss(self, action: str, entry_price: float) -> float:
-        """
-        Calculate stop loss price for a trade
-        """
+        """Calculate stop loss price for a trade"""
         if action == "BUY":
             return entry_price * (1 - self.stop_loss_pct)
         else:
@@ -671,21 +808,4 @@ class XGBoostStrategy(BaseStrategy):
     def _calculate_position_size(self, confidence: float) -> float:
         """Calculate position size based on model confidence"""
         base_size = 100  # Base position size
-        return round(base_size * confidence)
-
-    def create_trade_record(self, entry_time: datetime, exit_time: datetime,
-                          trade_type: str, size: float, entry_price: float,
-                          exit_price: float) -> Dict:
-        """Create a standardized trade record"""
-        pnl = (exit_price - entry_price) * size if trade_type == "LONG" else (entry_price - exit_price) * size
-        return {
-            'entry_time': entry_time,
-            'exit_time': exit_time,
-            'type': trade_type,
-            'size': size,
-            'entry_price': entry_price,
-            'exit_price': exit_price,
-            'pnl': pnl,
-            'return': (pnl / (entry_price * size)) * 100,
-            'stop_loss': self.current_stop_loss
-        }
+        return round(base_size * confidence) 

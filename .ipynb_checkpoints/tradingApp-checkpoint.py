@@ -71,6 +71,8 @@ class TradingApplication:
                 strategy = MACDStrategy(self.symbol, params)
             elif strategy_type == 'VWAP':
                 strategy = VWAPStrategy(self.symbol, params)
+            elif strategy_type == 'XGBoost':
+                strategy = XGBoostStrategy(self.symbol, params)
             else:
                 return {
                     'status': 'error',
