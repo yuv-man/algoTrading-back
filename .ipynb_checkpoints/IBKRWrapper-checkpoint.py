@@ -6,17 +6,17 @@ from ibapi.order import Order
 import queue
 import time
 import logging
-from threading import Thread, Lock, Event
 from datetime import datetime
 import pandas as pd
 from typing import Union, List
-
+import threading
 
 class IBKRWrapper(EWrapper, EClient):
     def __init__(self):
         EWrapper.__init__(self)
         EClient.__init__(self, self)
         self.client_id=1
+        
         
         # Data storage
         self.data_queue = queue.Queue()
@@ -28,7 +28,7 @@ class IBKRWrapper(EWrapper, EClient):
         self.is_connected = False
         self.is_market_data_connected = False
         self.is_historical_data_connected = False
-        self.connection_lock = Lock()
+        self.connection_lock = threading.Lock()
         self.reconnect_count = 0
         self.max_reconnect_attempts = 5
         self.reconnect_wait_time = 30  # seconds
@@ -39,26 +39,53 @@ class IBKRWrapper(EWrapper, EClient):
         self.completed_orders = {}
         self.positions_end = False
         self.orders_end = False
+        self.account_value = None
+        self.account_event = threading.Event()
+        self.account_details = {
+            'NetLiquidation': 0,
+            'AvailableFunds': 0,
+            'BuyingPower': 0,
+            'GrossPositionValue': 0,
+            'FullInitMarginReq': 0,
+            'FullMaintMarginReq': 0
+        }
+        self.managed_accounts = []
         
         # Position and order events
-        self.position_event = Event()
-        self.order_event = Event()
+        self.position_event = threading.Event()
+        self.order_event = threading.Event()
+        self.connect_event = threading.Event()
+        self.accounts_received = threading.Event()
         
         # Initialize logger
-        self.logger = logging.getLogger(__name__)
+        self.logger = logging.getLogger('IBKRWrapper')
+
+    def run(self):
+        """Override run method to include logging"""
+        try:
+            self.logger.debug("Starting client thread")
+            super().run()
+        except Exception as e:
+            self.logger.error(f"Error in client thread: {str(e)}")
+        finally:
+            self.logger.debug("Client thread finished")
         
     def error(self, reqId, errorCode, errorString):
-        """Handle various IB API error codes"""
         self.logger.error(f"Error {errorCode}: {errorString}")
-        
-        # Connection-related errors
-        if errorCode in [2110]:  # Connectivity between TWS and server is broken
-            self.handle_disconnection()
-            
-        elif errorCode in [2103, 2105, 2157]:  # Market data, HMDS, and Sec-def farm connection errors
-            self.handle_market_data_disconnection(errorString)
-            
-        # Other specific error handling can be added here
+        if errorCode == 504:  # Not connected
+            self.is_connected = False
+            self.connect_event.clear()
+
+    def connectionClosed(self):
+        self.logger.warning("Connection closed by server")
+        self.is_connected = False
+        self.connect_event.clear()
+        self.accounts_received.clear()
+
+    def connectAck(self):
+        self.logger.info("Connected to IBKR")
+        self.is_connected = True
+        self.connect_event.set()
         
     def handle_disconnection(self):
         """Handle main connection loss"""
@@ -75,11 +102,6 @@ class IBKRWrapper(EWrapper, EClient):
                 self.logger.warning(f"Market data connection lost: {error_string}")
                 self.is_market_data_connected = False
                 self.wait_for_market_data_reconnection()
-
-    def connectionClosed(self):
-        """Called when the connection is closed"""
-        self.logger.warning("Connection closed by server")
-        self.handle_disconnection()
 
     def start_reconnection(self):
         """Start the reconnection process"""
@@ -115,7 +137,7 @@ class IBKRWrapper(EWrapper, EClient):
             if not self.is_connected:
                 self.logger.error("Failed to reconnect after maximum attempts")
                 
-        Thread(target=reconnect_process, daemon=True).start()
+        threading.Thread(target=reconnect_process, daemon=True).start()
 
     def wait_for_market_data_reconnection(self):
         """Wait for market data farms to reconnect"""
@@ -127,12 +149,7 @@ class IBKRWrapper(EWrapper, EClient):
             if not self.is_market_data_connected:
                 self.logger.error("Market data reconnection timeout")
                 
-        Thread(target=market_data_reconnect_watch, daemon=True).start()
-
-    def connectAck(self):
-        """Called when connection is established"""
-        self.is_connected = True
-        self.logger.info("Connected to IBKR")
+        threading.Thread(target=market_data_reconnect_watch, daemon=True).start()
 
     def marketDataConnected(self):
         """Called when market data connection is established"""
@@ -177,6 +194,8 @@ class IBKRWrapper(EWrapper, EClient):
     def nextValidId(self, orderId):
         """Called when the next valid order ID is received"""
         self.next_valid_order_id = orderId
+        self.is_connected = True
+        self.connect_event.set()
         print(f"Next Valid Order ID: {orderId}")
 
     def historicalData(self, reqId, bar):
@@ -278,7 +297,7 @@ class IBKRWrapper(EWrapper, EClient):
         """Request historical data from IB"""
         self.historical_data = []
         endDateTime = ''
-        duration = '2 D'  # Request 2 days of data
+        duration = '1 M'  # Request 2 days of data
         
         self.reqHistoricalData(
             reqId=1,
@@ -651,8 +670,9 @@ class IBKRWrapper(EWrapper, EClient):
 
     def request_open_orders(self, timeout=30):
         """
-        Request all open orders
-        Returns a DataFrame of open orders after receiving all data
+        Request all open orders with detailed position information
+        Returns a DataFrame of open orders including quantity, profit, entry price,
+        stop loss, and take profit levels
         """
         try:
             # Reset order data and event
@@ -671,13 +691,94 @@ class IBKRWrapper(EWrapper, EClient):
                 self.logger.warning("No open orders found")
                 return pd.DataFrame()
                 
-            # Convert orders to DataFrame
-            df = pd.DataFrame(self.open_orders.values())
+            # Convert orders to DataFrame with additional position details
+            orders_data = []
+            for order in self.open_orders.values():
+                position_details = {
+                    'orderId': order.get('orderId'),
+                    'symbol': order.get('symbol'),
+                    'quantity': order.get('totalQuantity'),
+                    'entryPrice': order.get('lmtPrice'),
+                    'currentPrice': self.get_current_price(order.get('symbol')),  # You'll need to implement this
+                    'profit': 0,  # Will be calculated below
+                    'stopLoss': self.get_stop_loss(order.get('orderId')),  # Helper method to get associated stop loss
+                    'takeProfit': self.get_take_profit(order.get('orderId'))  # Helper method to get associated take profit
+                }
+                
+                # Calculate profit if position is open
+                if position_details['currentPrice'] and position_details['entryPrice']:
+                    position_details['profit'] = (
+                        (position_details['currentPrice'] - position_details['entryPrice']) 
+                        * position_details['quantity']
+                    )
+                
+                orders_data.append(position_details)
+                
+            df = pd.DataFrame(orders_data)
+            print(df)
             return df
             
         except Exception as e:
             self.logger.error(f"Error requesting open orders: {str(e)}")
             raise
+    
+    def get_stop_loss(self, orderId):
+        """
+        Helper method to get stop loss price for an order
+        """
+        try:
+            # Find associated stop loss order
+            for order in self.open_orders.values():
+                if (order.get('parentId') == orderId and 
+                    order.get('orderType') == 'STP'):
+                    return order.get('auxPrice')
+            return None
+        except Exception as e:
+            self.logger.error(f"Error getting stop loss: {str(e)}")
+            return None
+    
+    def get_take_profit(self, orderId):
+        """
+        Helper method to get take profit price for an order
+        """
+        try:
+            # Find associated take profit order
+            for order in self.open_orders.values():
+                if (order.get('parentId') == orderId and 
+                    order.get('orderType') == 'LMT' and 
+                    order.get('orderId') != orderId):
+                    return order.get('lmtPrice')
+            return None
+        except Exception as e:
+            self.logger.error(f"Error getting take profit: {str(e)}")
+            return None
+    
+    def managedAccounts(self, accountsList: str):
+        """Callback when managed accounts are received"""
+        try:
+            self.managed_accounts = accountsList.split(',')
+            self.accounts_received.set()
+            self.logger.info(f"Received managed accounts: {self.managed_accounts}")
+        except Exception as e:
+            self.logger.error(f"Error processing managed accounts: {str(e)}")
+
+    def updateAccountValue(self, key, value, currency, accountName):
+        """Callback for account value updates"""
+        try:
+            if currency != 'USD':
+                return
+
+            if key in self.account_details:
+                self.account_details[key] = float(value)
+                
+            if key == 'NetLiquidation':
+                self.account_value = float(value)
+                self.account_event.set()
+
+            self.logger.debug(f"Account Update - {key}: {value} {currency}")
+
+        except Exception as e:
+            self.logger.error(f"Error in updateAccountValue: {str(e)}")
 
     def get_completed_orders(self):
         """

@@ -3,14 +3,15 @@ from flask_socketio import SocketIO, emit
 from flask_cors import CORS
 from dataclasses import dataclass, asdict
 from datetime import datetime
-from threading import Thread
+import threading
 from typing import Dict, Any, Optional
 import logging
 from trading_engine import TradingEngine
 from tradingApp import TradingApplication
 import random #to delete
 import time
-
+import os
+import sys
 
 # Configure logging
 logging.basicConfig(
@@ -20,6 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
 CORS(app, resources={
     r"/*": {
         "origins": ["http://localhost:5173"],  # Your frontend origin
@@ -29,7 +31,7 @@ CORS(app, resources={
 })
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-trading_engine = TradingEngine()
+trading_engine = TradingEngine(socketio)
 trading_app = TradingApplication()
 
 def validate_dates(start_date: str, end_date: str) -> tuple[bool, Optional[str]]:
@@ -77,8 +79,7 @@ def register_strategy():
         is_valid, error_msg = validate_strategy_params(strategy_type, params)
         if not is_valid:
             return jsonify({'status': 'error', 'message': error_msg}), 400
-        
-        print(data)
+
         res = trading_app.register_strategy(symbol=symbol, strategy_type=strategy_type, params=params)
         print("results: ", res)
         logger.info(f"Strategy registered: {strategy_type} for {symbol}")
@@ -263,47 +264,62 @@ def get_stock_data():
             'message': f'Internal server error: {str(e)}'
         }), 500
 
-@app.route('/api/start_trading', methods=['POST'])
+@app.route('/api/start_trading', methods=['POST', 'OPTIONS'])
 def start_trading():
     """Start live trading with connection management and error handling."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'success'}), 200
+
     try:
-        if not trading_engine.strategy:
+        data = request.get_json()
+        if not data:
             return jsonify({
                 'status': 'error',
-                'message': 'No strategy registered'
+                'message': 'No data provided'
             }), 400
-        
-        if trading_engine.is_trading:
+
+        symbol = data.get('symbol', 'SPY')
+        interval = data.get('interval', '15 mins')
+        strategy_type = data.get('strategy_type')
+        params = data.get('params')
+
+        if not strategy_type:
             return jsonify({
                 'status': 'error',
-                'message': 'Trading already in progress'
+                'message': 'Strategy type is required'
             }), 400
-        
-        if not trading_engine.isConnected():
+
+        # Register strategy first
+        trading_app.register_strategy(symbol, strategy_type, params)
+
+        # Start trading in a background thread
+        def run_trading():
             try:
-                trading_engine.connect('127.0.0.1', 7497, 0)
-            except ConnectionError as e:
-                return jsonify({
-                    'status': 'error',
-                    'message': f'Failed to connect to trading server: {str(e)}'
-                }), 500
-        
-        trading_thread = threading.Thread(
-            target=trading_engine.start_live_trading,
-            daemon=True  # Ensure thread doesn't block program exit
-        )
+                trading_app.start_trading(symbol, interval, strategy_type)
+            except Exception as e:
+                logger.error(f"Error in trading thread: {str(e)}")
+                trading_app.trading_engine.stop_live_trading()
+
+        trading_thread = threading.Thread(target=run_trading, daemon=True)
         trading_thread.start()
         
-        logger.info("Live trading started")
+        logger.info(f"Live trading started for {symbol} with {strategy_type} strategy")
         return jsonify({
             'status': 'success',
             'message': 'Live trading started',
-            'strategy': trading_engine.strategy.__class__.__name__
+            'data': {
+                'symbol': symbol,
+                'interval': interval,
+                'strategy': strategy_type
+            }
         })
         
     except Exception as e:
         logger.error(f"Error starting trading: {str(e)}")
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
 
 @app.route('/api/stop_trading', methods=['POST'])
 def stop_trading():
@@ -425,7 +441,6 @@ def optimize_strategy():
                 param_ranges=param_ranges,
                 initial_guess=initial_guess
             )
-            print(result)
 
             return jsonify({
             'status': 'success',
@@ -450,17 +465,12 @@ def optimize_strategy():
 def get_orders():
     """Get current strategy performance with detailed metrics."""
     try:
-        if not trading_engine.strategy:
-            return jsonify({
-                'status': 'error',
-                'message': 'No strategy registered'
-            }), 400
-        
-        orders = trading_engine.get_orders(symbol)
+        orders = trading_engine.get_orders()
+        json_orders = orders.to_json(orient='records', date_format='iso', double_precision=2)
         
         return jsonify({
             'status': 'success',
-            'orders': orders
+            'orders': json_orders
         })
         
     except Exception as e:
@@ -469,15 +479,9 @@ def get_orders():
 
 @app.route('/api/watchlist', methods=['GET'])
 def get_positions():
-    """Get current strategy performance with detailed metrics."""
-    try:
-        if not trading_engine.strategy:
-            return jsonify({
-                'status': 'error',
-                'message': 'No strategy registered'
-            }), 400
-        
-        positions = trading_engine.get_positions()
+    """Get current positions."""
+    try:     
+        positions = trading_engine.get_positions_summary()
         
         return jsonify({
             'status': 'success',
@@ -488,16 +492,31 @@ def get_positions():
         logger.error(f"Error getting positions: {str(e)}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-def generate_trading_data():
-    while True:
-        trading_data = {
-            'symbol': 'BTC/USD',
-            'price': round(random.uniform(30000, 40000), 2),
-            'volume': round(random.uniform(100, 1000), 2),
-            'timestamp': int(time.time())
-        }
-        socketio.emit('trading_update', trading_data)
-        time.sleep(1)  # Send updates every second
+@app.route('/api/get_account_value', methods=['GET'])
+def get_account_value():
+    """Get current account value."""
+    try: 
+        account_value = trading_engine.get_account_info()
+        
+        return jsonify({
+            'status': 'success',
+            'account_value': account_value
+        })
+        
+    except Exception as e:
+        logger.error(f"Error getting account value: {str(e)}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/')
+def list_routes():
+    routes = []
+    for rule in app.url_map.iter_rules():
+        routes.append({
+            'endpoint': rule.endpoint,
+            'methods': list(rule.methods),
+            'path': str(rule)
+        })
+    return jsonify(routes)
 
 @socketio.on('connect')
 def handle_connect():
@@ -521,24 +540,39 @@ def not_found(error):
 def method_not_allowed(error):
     return jsonify({'status': 'error', 'message': 'Method not allowed'}), 405
 
-@socketio.on('connect')
-def handle_connect():
-    print('Client connected')
-    emit('connected', {'data': 'Connected to trading websocket server'})
-
-@socketio.on('disconnect')
-def handle_disconnect():
-    print('Client disconnected')
-
-@socketio.on('subscribe')
-def handle_subscribe(symbol):
-    print(f'Client subscribed to {symbol}')
-    emit('subscribed', {'symbol': symbol})
+def generate_trading_data():
+    while True:
+        trading_data = {
+            'symbol': 'BTC/USD',
+            'price': round(random.uniform(30000, 40000), 2),
+            'volume': round(random.uniform(100, 1000), 2),
+            'timestamp': int(time.time())
+        }
+        socketio.emit('trading_update', trading_data)
+        time.sleep(1)  # Send updates every second
 
 if __name__ == '__main__':
-    # Start the trading data generator in a separate thread
-    trading_thread = Thread(target=generate_trading_data)
-    trading_thread.daemon = True
-    trading_thread.start()
+    import multiprocessing
+    # Windows-specific multiprocessing support
+    if sys.platform.startswith('win'):
+        multiprocessing.freeze_support()
     
-    socketio.run(app, debug=True, port=5001)
+    try:
+        # Start the trading data generator in a separate thread
+        trading_thread = threading.Thread(target=generate_trading_data)
+        trading_thread.daemon = True
+        trading_thread.start()
+        
+        # Windows-specific Flask configuration
+        socketio.run(app, 
+                    host='127.0.0.1',
+                    port=5001,
+                    debug=True,
+                    use_reloader=False)  # Disable reloader for Windows
+                    
+    except KeyboardInterrupt:
+        print("Shutting down...")
+    finally:
+        # Cleanup
+        if hasattr(trading_app, 'app'):
+            trading_app.disconnect()

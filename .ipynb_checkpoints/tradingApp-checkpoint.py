@@ -110,8 +110,8 @@ class TradingApplication:
             
         try:
             if self.loadHistoricalDataFromCSV:
-                csv_path_intraday = 'stock_data_SPY/SPY_20250107 12:38:01_to_20250108 12:38:01_intraday.csv'
-                csv_path_daily = 'stock_data_SPY/SPY_20250107 12:38:01_to_20250108 12:38:01_daily.csv'
+                csv_path_intraday = 'stock_data_SPY/SPY_20250118_19-42-32_to_20250118_19-42-32_intraday.csv'
+                csv_path_daily = 'stock_data_SPY/SPY_20250118_19-42-32_to_20250118_19-42-32_daily.csv'
                 self.intraday_data = self.load_historical_data(csv_path=csv_path_intraday)
                 self.daily_data = self.load_historical_data(csv_path=csv_path_daily)
 
@@ -123,7 +123,6 @@ class TradingApplication:
                         symbol=symbol
                     )
             intra_day_data_with_trends = self.daily_trends_analyze()
-            print(intra_day_data_with_trends)
             return {'intraday_data': intra_day_data_with_trends, 'daily_data': self.daily_data}         
 
         except Exception as e:
@@ -149,8 +148,8 @@ class TradingApplication:
                 return {'status': 'error', 'message': 'No strategy registered'}
 
             if self.loadHistoricalDataFromCSV:
-                csv_path_intraday = 'stock_data_SPY/SPY_20250107 12:38:01_to_20250108 12:38:01_intraday.csv'
-                csv_path_daily = 'stock_data_SPY/SPY_20250107 12:38:01_to_20250108 12:38:01_daily.csv'
+                csv_path_intraday = 'stock_data_SPY/SPY_20250118_19-42-32_to_20250118_19-42-32_intraday.csv'
+                csv_path_daily = 'stock_data_SPY/SPY_20250118_19-42-32_to_20250118_19-42-32_daily.csv'
                 self.intraday_data = self.load_historical_data(csv_path=csv_path_intraday)
                 self.daily_data = self.load_historical_data(csv_path=csv_path_daily)
             # Get historical data using trading engine
@@ -454,25 +453,35 @@ class TradingApplication:
             
             print(f"{metric:<25}{total_str}{long_str}{short_str}")
 
-    def start_trading(self, interval) -> Dict:
-        """Start live trading"""
+    def start_trading(self, symbol: str, interval: str, strategy_type: str) -> Dict:
+        """Start live trading for a specific symbol"""
         self.interval = interval
+        self.symbol = symbol
         try:
-            result = self.trading_engine.start_trading(self.symbol, self.interval)
-            logger.info("Live trading started")
+            if not self.trading_engine:
+                raise ValueError("Trading engine not initialized")
+                
+            # Start trading
+            self.trading_engine.start_trading(symbol, interval, strategy_type)
+            
+            logger.info(f"Live trading started successfully for {symbol}")
             return {
                 'status': 'success',
-                'message': 'Live trading started',
-                'strategy': self.strategy_name
+                'message': f'Live trading started for {symbol}',
+                'strategy': self.strategy_name,
+                'active_trades': self.trading_engine.get_active_trades()
             }
         except Exception as e:
-            logger.error(f"Error starting trading: {str(e)}")
-            return {'status': 'error', 'message': str(e)}
+            logger.error(f"Error starting trading for {symbol}: {str(e)}")
+            # Make sure to stop trading if there's an error
+            if self.trading_engine:
+                self.trading_engine.stop_trading(symbol)
+            raise
 
     def stop_trading(self) -> Dict:
         """Stop live trading"""
         try:
-            self.trading_engine.stop_live_trading()
+            self.trading_engine.stop_trading()
             logger.info("Live trading stopped")
             
             metrics = self.calculate_metrics(self.trading_engine.strategy.trades)
@@ -587,14 +596,16 @@ class TradingApplication:
         # Create the output directory if it does not exist
         os.makedirs(output_dir, exist_ok=True)
         
-        # Fetch stock data using yfinance
-        
-        
         if data is None:
             raise ValueError(f"No data found for symbol '{symbol}' in the specified date range.")
+
+        def format_date_for_filename(date_str):
+            return date_str.replace(':', '-').replace(' ', '_')
+        start_date = format_date_for_filename(self.start_date)
+        end_date = format_date_for_filename(self.start_date)
         
         # Save the data to a CSV file
-        file_path = os.path.join(output_dir, f"{self.symbol}_{self.start_date}_to_{self.end_date}_{after}.csv")
+        file_path = os.path.join(output_dir, f"{self.symbol}_{start_date}_to_{end_date}_{after}.csv")
         data.to_csv(file_path)
         print(f"Data saved to {file_path}")
         
